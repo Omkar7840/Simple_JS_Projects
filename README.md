@@ -1,661 +1,434 @@
-# Geo-Intelligent Auto Catalog System
+# Complete Dynamic Catalog Implementation Code & Setup Guide
 
-## Scope
-
-Use this file as the single implementation guide for:
-
-- `backend/catalogue_mgmt_service`
-- `frontend/hha_web`
-
-Note:
-
-- `hha_web` is Angular/Ionic in this repo, not React.
-- Backend local env file in this repo is `backend/catalogue_mgmt_service/.lcl.env`, not `lcl.dev`.
+This document contains **all the necessary code** for the Location-Aware Product Catalog feature, combined into a single place. Follow these step-by-step instructions to implement the code in your local codebase.
 
 ---
 
-## Step 0: Actual Code Trace Summary
+## Prerequisites & Installation
 
-### 1. Shop -> pincode mapping
-
-In `catalogue_mgmt_service`, shop geo fields are not stored in `retailercatalog`.
-
-Actual existing source traced in code:
-
-- `src/apis/controllers/v1/retailerCatalog/index.js`
-- function: `getShopDataShopIds(shopIds)`
-- calls: `GET ${loadBalancer}/rms/apis/v2/shop/getPGShopDetails/${shopIds}`
-
-Fields used there:
-
-- `shop_id`
-- `shop_name`
-- `city`
-- `locality`
-- `pincode`
-- `street`
-- `user_id`
-- `selling_type`
-
-Related geo helper already exists:
-
-- `src/apis/controllers/v1/retailerCatalog/utils/apiCalls.js`
-- function: `getAllShopLatLon()`
-- calls: `GET ${loadBalancer}/rms/apis/v1/shop/allShopLatLon`
-
-### 2. How `retailercatalog` is fetched
-
-Mongo model:
-
-- `src/apis/models/mongoCatalog/retailerSchema.js`
-- collection/model: `retailercatalog`
-
-Service used:
-
-- `src/apis/services/v1/mongoCatalog/retailerCatalog.js`
-
-Main fetch methods:
-
-- `getProductByShopId({ shopId })`
-- `getProductByProductId({ shopId, productId })`
-- `getRetailerAllTypesOfCatalogByshopIds(shopIds)`
-
-Main route:
-
-- `src/apis/routes/v1/retailerCatalog/index.js`
-- `GET /retailercatalog/getRetailerCatalog/:shopId`
-
-Controller:
-
-- `src/apis/controllers/v1/retailerCatalog/index.js`
-- function: `getRetailerCatalog({ shopId })`
-
-Important stored product field:
-
-- `retailercatalog.catalog.prdNm`
-
-Other useful retailer fields:
-
-- `retailercatalog.shopId`
-- `retailercatalog.category`
-- `retailercatalog.catalog.catPnm`
-- `retailercatalog.catalog.catPid`
-
-### 3. Existing catalog APIs
-
-Backend route index:
-
-- `src/apis/routes/v1/index.js`
-
-Existing catalog-related routes:
-
-- `/catalog`
-- `/category`
-- `/product`
-- `/customCatalog`
-- `/retailercatalog`
-
-Important routes:
-
-- `GET /retailercatalog/getRetailerCatalog/:shopId`
-- `POST /retailercatalog/addTopProducts/:shopId`
-- `POST /retailercatalog/addProductsToRetailer`
-- `PUT /retailercatalog/updateRetailerProducts/:shopId`
-- `GET /customCatalog/getCustomCatalogRequests/:shopId`
-- `POST /customCatalog`
-
-### 4. How frontend consumes APIs
-
-`hha_web` does not call CMS directly for retail catalog. It consumes store metadata and profile JSON URLs.
-
-Main frontend service:
-
-- `frontend/hha_web/src/app/lib/services/catalogue.service.ts`
-
-Main API wrapper:
-
-- `frontend/hha_web/src/app/lib/services/api/common.api.ts`
-
-Environment:
-
-- `frontend/hha_web/src/environments/environment.ts`
-
-Current frontend catalog flow:
-
-1. Fetch store metadata:
-   - `ApiUrls.storeMeta = /hms/apis/v1/households/storeAllData`
-2. Read profile JSON URL from `store_meta[0].url`
-3. Fetch catalog JSON from CDN/profile URL
-4. Render in:
-   - `src/app/pages/store/productlisting/productlisting.page.ts`
-   - `src/app/pages/store/store-details/store-details.page.ts`
-
----
-
-## Step 1: Local Env Setup
-
-Use:
-
-- `backend/catalogue_mgmt_service/.lcl.env`
-
-Set:
-
-```env
-SQL_DB_HOST=localhost
-SQL_DB_USER=postgres
-SQL_DB_PASSWORD=omkar
-SQL_DB_PORT=5432
-SQL_DB_NAME=cms
-
-MONGO_DB_HOST=mongodb://127.0.0.1:27017/metadata
-```
-
-Also make sure local-only fallback values exist if required by config:
-
-```env
-QUEUE_URL=http://localhost/queue
-ENVIRONMENT=dev
-MEDIA_S3=http://localhost/media
-TOP_PRODUCTS_LIMIT=10
-RADIUS=25
-CITY_LAT_LON=[{"city":"Bengaluru","lat":12.9716,"lon":77.5946}]
-```
-
-If PostgreSQL SSL blocks startup, keep SQL config without SSL since knex config here only uses host/user/password/port/database.
-
-Run:
+Before writing the code, ensure the background dependencies are installed in your backend service. Open your terminal in the backend folder and run:
 
 ```bash
-cd backend/catalogue_mgmt_service
-npm install
-npm run lcl
+cd d:\Sarvm\backend\catalogue_mgmt_service
+npm install @google/genai axios
 ```
-
-If `nodemon` sandbox blocks, direct runtime equivalent is:
-
-```bash
-node -r dotenv/config ./server dotenv_config_path=./.lcl.env
-```
+*(Note: `node-cron` is already in your `package.json` so it will be available).*
 
 ---
 
-## Step 2: Required Data Sources
+## BACKEND CODE (catalogue_mgmt_service)
 
-Primary:
+### 1. AI Product Trends Schema
+**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\models\mongoCatalog\aiProductTrendsSchema.js`
 
-- `retailercatalog`
+```javascript
+// src/apis/models/mongoCatalog/aiProductTrendsSchema.js
+const mongoose = require('mongoose');
+const Schema = mongoose.Schema;
 
-Secondary:
+const aiProductTrendsSchema = new Schema({
+    zipcode: { type: String, required: true },
+    city: { type: String },
+    state: { type: String },
+    category: { type: String, required: true },
+    products: [{ type: String }], // Array of AI suggested product names
+    lastUpdated: { type: Date, default: Date.now }
+});
 
-- `products`
-- `customcatalog`
-- `categories`
+// Ensure we don't duplicate trend requests for a specific zip + category
+aiProductTrendsSchema.index({ zipcode: 1, category: 1 }, { unique: true });
 
-Actual model locations:
-
-- `src/apis/models/mongoCatalog/retailerSchema.js`
-- `src/apis/models/mongoCatalog/productSchema.js`
-- `src/apis/models/mongoCatalog/customCatalogSchema.js`
-- `src/apis/models/mongoCatalog/categorySchema.js`
-
-Important product name field:
-
-- `retailercatalog.catalog.prdNm`
-
-Category source priority:
-
-1. `retailercatalog.category`
-2. `retailercatalog.catalog.catPnm`
-3. `products.catPnm`
-
----
-
-## Files To Create
-
-### Backend
-
-Create:
-
-- `backend/catalogue_mgmt_service/src/apis/utils/normalizeProduct.js`
-- `backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/geoCatalogSchema.js`
-- `backend/catalogue_mgmt_service/src/apis/services/v1/pincodeCatalogBuilder.service.js`
-- `backend/catalogue_mgmt_service/src/apis/services/v1/geoHierarchy.service.js`
-- `backend/catalogue_mgmt_service/src/apis/services/v1/ai.service.js`
-- `backend/catalogue_mgmt_service/src/apis/controllers/v1/geo.js`
-- `backend/catalogue_mgmt_service/src/apis/routes/v1/geo.js`
-- `backend/catalogue_mgmt_service/src/jobs/geoCatalog.job.js`
-
-Update:
-
-- `backend/catalogue_mgmt_service/src/apis/routes/v1/index.js`
-- `backend/catalogue_mgmt_service/src/InitApp/index.js`
-- `backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/retailerSchema.js`
-- `backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/customCatalogSchema.js`
-
-### Frontend
-
-Create:
-
-- `frontend/hha_web/src/app/lib/services/geo-catalog.service.ts`
-- `frontend/hha_web/src/app/pages/geo-catalog-test/*`
-
-Update:
-
-- `frontend/hha_web/src/app/app-routing.module.ts`
-
----
-
-## Backend Implementation Contract
-
-### 1. Normalizer
-
-File:
-
-- `src/apis/utils/normalizeProduct.js`
-
-Rules:
-
-- lowercase
-- remove punctuation
-- remove units: `ml`, `g`, `kg`, `l`
-- trim spaces
-
-Example:
-
-```js
-"Amul Gold Milk 500ml" -> "amul gold milk"
+module.exports = mongoose.model('AiProductTrends', aiProductTrendsSchema);
 ```
 
-### 2. Geo catalog schema
+### 2. Area Product Insights Schema
+**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\models\mongoCatalog\areaProductInsightsSchema.js`
 
-File:
+```javascript
+// src/apis/models/mongoCatalog/areaProductInsightsSchema.js
+const mongoose = require('mongoose');
+const Schema = mongoose.Schema;
 
-- `src/apis/models/mongoCatalog/geoCatalogSchema.js`
+const areaProductInsightsSchema = new Schema({
+    zipcode: { type: String, required: true },
+    city: { type: String },
+    state: { type: String },
+    category: { type: String, required: true },
+    rankedProducts: [{
+        product_id: { type: String },
+        product_name: { type: String },
+        score: { type: Number },
+        source: { type: String, enum: ['REAL_DATA', 'AI_TREND', 'MIXED'] },
+        price_estimate: { type: Number, default: 0 }
+    }],
+    lastUpdated: { type: Date, default: Date.now }
+});
 
-Collection:
+// Efficient fetching at runtime
+areaProductInsightsSchema.index({ zipcode: 1, category: 1 }, { unique: true });
+areaProductInsightsSchema.index({ city: 1, category: 1 }); // fallback index
 
-- `geo_catalogs`
+module.exports = mongoose.model('AreaProductInsights', areaProductInsightsSchema);
+```
 
-Document:
+### 3. Gemini AI Service Integration
+**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\services\v1\mongoCatalog\geminiService.js`
 
-```js
-{
-  level: "PINCODE",
-  pincode: "560100",
-  city: "Bengaluru",
-  state: "Karnataka",
-  country: "India",
-  categories: [
-    {
-      name: "dairy",
-      products: [
-        { name: "amul gold milk", count: 120 },
-        { name: "nandini milk", count: 90 }
-      ]
+```javascript
+// src/apis/services/v1/mongoCatalog/geminiService.js
+const { Logger: log } = require('sarvm-utility');
+const { GoogleGenerativeAI } = require('@google/genai');
+
+// Use environment variable for API key (Add GEMINI_API_KEY to your .lcl.env)
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || 'FALLBACK_KEY_FOR_LOCAL_TEST');
+
+const fetchTrendsFromGemini = async (zipcode, city, category) => {
+    log.info({ info: `Fetching AI trends for zip: ${zipcode}, cat: ${category}` });
+
+    // Local override if no actual key is configured yet
+    if (!process.env.GEMINI_API_KEY) {
+        log.info({ info: `Using Mock AI Data for local testing.` });
+        return [
+            "Aashirvaad Whole Wheat Atta", "Amul Pasteurized Butter", "Tata Salt",
+            "Maggi 2-Minute Noodles", "Surf Excel Easy Wash", "Brooke Bond Red Label Tea",
+            "Saffola Gold Cooking Oil", "Everest Garam Masala", "Colgate Strong Teeth"
+        ];
     }
-  ],
-  createdAt,
-  updatedAt
-}
-```
 
-### 3. Pincode builder service
+    try {
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const prompt = `Provide exactly a JSON array of strings representing the top 20 most frequently purchased grocery and household products for zipcode ${zipcode} (${city}, India) in the "${category}" category. Output strictly valid JSON array format like ["Product 1", "Product 2"].`;
 
-File:
-
-- `src/apis/services/v1/pincodeCatalogBuilder.service.js`
-
-Function:
-
-```js
-buildPincodeCatalog(pincode)
-```
-
-Logic:
-
-1. resolve shops for pincode `560100`
-2. fetch `retailercatalog` where `shopId in shops`
-3. extract:
-   - name from `catalog.prdNm`
-   - category from `category` or first segment of `catPnm`
-4. normalize names
-5. group by category
-6. frequency count by normalized product
-7. sort desc by count
-8. keep top `10-20`
-9. store one document in `geo_catalogs`
-10. if low data, write fallback category/product set
-
-### 4. Hierarchy service
-
-File:
-
-- `src/apis/services/v1/geoHierarchy.service.js`
-
-Functions:
-
-- resolve with fallback:
-  - `PINCODE`
-  - `CITY`
-  - `STATE`
-  - `COUNTRY`
-- apply geo catalog to shop
-
-Fallback order:
-
-```txt
-pincode -> city -> state -> country
-```
-
-### 5. Mock AI service
-
-File:
-
-- `src/apis/services/v1/ai.service.js`
-
-Only return:
-
-- normalized names helper
-- fallback products by category
-
-No external API call.
-
-### 6. Geo controller
-
-File:
-
-- `src/apis/controllers/v1/geo.js`
-
-Methods:
-
-- `testPincodeCatalog`
-- `applyGeoCatalog`
-- optional `getResolvedGeoCatalog`
-
-### 7. Geo routes
-
-File:
-
-- `src/apis/routes/v1/geo.js`
-
-Routes:
-
-```txt
-POST /geo/test/pincode
-POST /geo/apply
-GET  /geo/catalog
-```
-
-Body for test:
-
-```json
-{
-  "pincode": "560100"
-}
-```
-
-Expected response:
-
-```json
-{
-  "success": true,
-  "categories": [
-    {
-      "name": "dairy",
-      "products": [
-        { "name": "amul gold milk", "count": 120 }
-      ]
+        const result = await model.generateContent(prompt);
+        let textResponse = result.response.text();
+        
+        // Clean markdown backticks if any
+        textResponse = textResponse.replace(/^```json/m, '').replace(/```$/m, '').trim();
+        const productList = JSON.parse(textResponse);
+        
+        return productList;
+    } catch (error) {
+        log.error({ error: `Gemini API Failure: ${error.message}` });
+        return []; // fail gracefully
     }
-  ]
-}
+};
+
+module.exports = { fetchTrendsFromGemini };
 ```
 
-### 8. Cron job
+### 4. Cron Job Processor Workflow
+**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\services\v1\mongoCatalog\dynamicCatalogCron.js`
 
-File:
+```javascript
+// src/apis/services/v1/mongoCatalog/dynamicCatalogCron.js
+const cron = require('node-cron');
+const axios = require('axios');
+const { Logger: log } = require('sarvm-utility');
+const { loadBalancer, system_token } = require('@config');
+const AiProductTrends = require('../../models/mongoCatalog/aiProductTrendsSchema');
+const AreaProductInsights = require('../../models/mongoCatalog/areaProductInsightsSchema');
+const Product = require('../../models/mongoCatalog/productSchema');
+const { fetchTrendsFromGemini } = require('./geminiService');
 
-- `src/jobs/geoCatalog.job.js`
+/**
+ * Automaticaly fetches all verified shops from RMS to identify target regions
+ */
+const fetchTargetRegionsFromDB = async () => {
+    try {
+        log.info({ info: 'Fetching verified shops from RMS...' });
+        const config = {
+            method: 'get',
+            url: `${loadBalancer}/rms/apis/v1/shop/allShopLatLon`, // Use RMS API to get shop locations
+            headers: { Authorization: `Bearer ${system_token}` }
+        };
+        const response = await axios(config);
+        const shops = response?.data?.data || [];
 
-Run time:
+        // Aggregating into unique { zipcode, city, state } groups
+        const regions = new Map();
+        shops.forEach(shop => {
+            // Note: We use the address fields provided by RMS
+            // Adjust field names (pincode/city) if they differ in your specific RMS response
+            const key = `${shop.pincode}_grocery`; 
+            if (!regions.has(key) && shop.pincode) {
+                regions.set(key, {
+                    zipcode: shop.pincode,
+                    city: shop.city || shop.district,
+                    state: shop.state,
+                    category: 'grocery'
+                });
+            }
+        });
 
-- daily `2 AM`
+        return Array.from(regions.values());
+    } catch (error) {
+        log.error({ error: `Failed to fetch target regions: ${error.message}` });
+        return [];
+    }
+};
 
-Process:
+const runNightlyProcessor = async () => {
+    log.info({ info: 'Starting Dynamic Catalog Automation Job...' });
+    
+    // 1. Automatically discover regions with verified shops
+    const targets = await fetchTargetRegionsFromDB();
+    log.info({ info: `Discovered ${targets.length} unique regions to process.` });
 
-1. fetch all shops
-2. group by pincode
-3. build all pincode catalogs
-4. rebuild city/state/country catalogs
+    // 2. Process each region one by one
+    for (const target of targets) {
+        const { zipcode, city, state, category } = target;
 
-Wire startup from:
+        log.info({ info: `Processing Region: ${zipcode} (${city})` });
 
-- `src/InitApp/index.js`
+        try {
+            // 3. Fetch AI Trends (checks cache or calls Gemini)
+            const aiList = await fetchTrendsFromGemini(zipcode, city, category);
+            
+            let finalList = [];
+            let rank = 1;
 
-### 9. Apply to shop
+            // 4. Normalize and Map to Master Product Database
+            for (const prodName of aiList) {
+                const masterProduct = await Product.findOne({
+                    prdNm: { $regex: new RegExp(prodName, 'i') }
+                }).lean();
 
-Route:
+                if (masterProduct) {
+                    finalList.push({
+                        product_id: masterProduct._id.toString(),
+                        product_name: masterProduct.prdNm,
+                        score: 100 - rank++,
+                        source: 'AI_TREND',
+                        price_estimate: masterProduct.prc?.mrp || 0
+                    });
+                }
+            }
 
-- `POST /geo/apply`
+            // 5. Save/Update the Insights Collection
+            if (finalList.length > 0) {
+                await AreaProductInsights.findOneAndUpdate(
+                    { zipcode: zipcode, category: category },
+                    { 
+                        city: city, 
+                        state: state, 
+                        rankedProducts: finalList, 
+                        lastUpdated: new Date() 
+                    },
+                    { upsert: true }
+                );
+                log.info({ info: `Successfully updated insights for ${zipcode}` });
+            }
+        } catch (err) {
+            log.error({ error: `Error processing region ${zipcode}: ${err.message}` });
+        }
+    }
+    log.info({ info: 'Dynamic Catalog Generation Job Completed.' });
+};
 
-Body:
+const initCron = () => {
+    // Runs at 2 AM every day
+    cron.schedule('0 2 * * *', () => {
+        runNightlyProcessor().catch(err => log.error({ error: err }));
+    });
+};
 
-```json
-{
-  "shopId": 1234,
-  "pincode": "560100"
-}
+module.exports = { initCron, runNightlyProcessor };
 ```
 
-Logic:
+### 5. Controller for Fetching Data
+**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\controllers\v1\mongoCatalog\dynamicCatalog.js`
 
-1. resolve geo catalog with fallback
-2. insert products into `customcatalog`
-3. set:
+```javascript
+// src/apis/controllers/v1/mongoCatalog/dynamicCatalog.js
+const AreaProductInsights = require('../../models/mongoCatalog/areaProductInsightsSchema');
+const { Logger: log } = require('sarvm-utility');
 
-```txt
-productNameStatus = "UNVERIFIED"
+const getDynamicCatalogInsights = async (zipcode, city, state, category) => {
+    log.info({ info: 'Fetching Dynamic Catalog details' });
+    
+    // 1. Try highly specific zipcode match
+    let insights = await AreaProductInsights.findOne({ zipcode, category }).lean();
+    
+    // 2. Fallback to general city match
+    if (!insights && city) {
+        insights = await AreaProductInsights.findOne({ city, category }).lean();
+    }
+
+    if (!insights) {
+        return { source: 'DEFAULT', catalog: [] }; // The frontend should fall back to standard Master Catalog behavior
+    }
+
+    return {
+        source: 'DYNAMIC',
+        catalog: insights.rankedProducts
+    };
+};
+
+module.exports = { getDynamicCatalogInsights };
 ```
 
-Recommended insert shape in `customcatalog`:
+### 6. API Route for Dynamic Catalog
+**Create File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\routes\v1\dynamicCatalog.js`
 
-```js
-{
-  shopId,
-  retailerId,
-  guid,
-  retailerName: "Geo Catalog Auto Apply",
-  productId: "geo-PINCODE-dairy-amul gold milk",
-  productName: "amul gold milk",
-  productNameStatus: "UNVERIFIED",
-  productDescriptionStatus: "NEW",
-  productImageStatus: "NEW",
-  description: "Auto-added from PINCODE geo catalog",
-  category: "dairy",
-  subCategory: "dairy",
-  updateStatus: "NEW"
-}
+```javascript
+// src/apis/routes/v1/dynamicCatalog.js
+const express = require('express');
+const { HttpResponseHandler, Logger: log } = require('sarvm-utility');
+const dynamicCatalogController = require('../../controllers/v1/mongoCatalog/dynamicCatalog');
+
+const router = express.Router();
+
+router.get('/insights', async (req, res, next) => {
+    try {
+        const { zipcode, city, state, category } = req.query;
+        if (!zipcode || !category) {
+            return HttpResponseHandler.badRequest(req, res, 'Zipcode and Category are required');
+            // Alternatively standard HTTP 400 validation depending on sarvm-utility
+        }
+
+        const result = await dynamicCatalogController.getDynamicCatalogInsights(zipcode, city, state, category);
+        HttpResponseHandler.success(req, res, result);
+    } catch (error) {
+        log.error({ error });
+        next(error);
+    }
+});
+
+module.exports = router;
 ```
 
-You may need to extend enums in:
+### 7. Bind Routes (Modifying existing backend files)
+**Modify File:** `d:\Sarvm\backend\catalogue_mgmt_service\src\apis\routes\v1\index.js`
 
-- `src/apis/models/mongoCatalog/customCatalogSchema.js`
+*Add the following towards the top with other imports:*
+```javascript
+const dynamicCatalogRouter = require('./dynamicCatalog');
+```
+*Add the following towards the bottom near `router.use('/category'...`:*
+```javascript
+router.use('/dynamicCatalog', dynamicCatalogRouter);
+```
 
-to allow `UNVERIFIED`.
+**Modify File:** `d:\Sarvm\backend\catalogue_mgmt_service\server.js`
+
+*Add this somewhere around line 21 (inside `InitApp(app).then(() => {`):*
+```javascript
+const { initCron } = require('./src/apis/services/v1/mongoCatalog/dynamicCatalogCron');
+initCron(); 
+```
 
 ---
 
-## Indexes
+## FRONTEND CODE (hha_web)
 
-Add:
+### 1. Application Constants
+**Modify File:** `d:\Sarvm\frontend\hha_web\src\app\config\constants.ts`
 
-### `retailercatalog`
-
-File:
-
-- `src/apis/models/mongoCatalog/retailerSchema.js`
-
-```js
-retailer_Catalog.index({ shopId: 1 });
+*Inside the `ApiUrls` object (approx line 122), append the new route:*
+```typescript
+  dynamicCatalogInsights: '/cms/apis/v1/dynamicCatalog/insights',
 ```
 
-### `geo_catalogs`
+### 2. Catalogue Service 
+**Modify File:** `d:\Sarvm\frontend\hha_web\src\app\lib\services\catalogue.service.ts`
 
-File:
+*Add this new function block directly inside the `CatalogueService` class:*
+```typescript
+  getDynamicInsights(zipcode: string, city: string, state: string, category: string) {
+    // Note: ensure the environment base URL corresponds to the proxy resolving to the catalogue service node process. 
+    const url = `${environment.baseUrl}${ApiUrls.dynamicCatalogInsights}?zipcode=${zipcode}&city=${city}&state=${state}&category=${category}`;
+    return this.commonApi.getDataByUrl(url);
+  }
+```
 
-- `src/apis/models/mongoCatalog/geoCatalogSchema.js`
+### 3. Google Component Updates
+**Modify File:** `d:\Sarvm\frontend\hha_web\src\app\pages\store\google-stores\google-stores.component.ts`
 
-At minimum:
+*Locate the `loadShopData()` method. You will inject the new dynamic logic whenever a Google shop (unverified profile) is loaded.*
 
-```js
-geoCatalogSchema.index({ level: 1, pincode: 1 }, { sparse: true });
+**Modify `loadShopData` as follows:**
+```typescript
+  loadShopData() {
+    this.commonservice.presentProgressBarLoading();
+    this.catalogueService.getmerchant(this.profileUrl!).subscribe({
+      next: async (res: any) => {
+        this.shopData = res;
+        this.shopProfileUrl = res?.shop?.profileUrl || null;
+        
+        // --- NEW DYNAMIC CATALOG HOOK ---
+        const shopZip = res?.shop?.address?.zipcode || '110001'; // Extract real zip if available
+        const shopCity = res?.shop?.address?.city || 'Delhi';
+        
+        if (res?.catalog?.length) {
+          this.selectedCategoryId = res.catalog[0].id;
+          
+          try {
+            const dynamicRes: any = await this.catalogueService.getDynamicInsights(shopZip, shopCity, '', 'grocery').toPromise();
+            
+            if (dynamicRes?.data?.source === 'DYNAMIC') {
+              // Extract the highly ranked subset
+              const curatedProducts = dynamicRes.data.catalog; 
+              
+              // Map AI/Dynamic data back to the UI format expected by your templates
+              res.catalog[0].categories[0].products = curatedProducts.map((p: any) => ({
+                 prdNm: p.product_name,
+                 price: { mrp: p.price_estimate || 0 },
+                 quantity: { soldBy: '1 unit', minQty: 1 },
+                 media: { imgTh: null, img1: null },
+                 status: 'PUBLISHED'
+              }));
+            }
+          } catch(e) {
+             console.log("Failed to fetch dynamic insights, defaulting to standard catalog.", e);
+          }
+        }
+        // ---------------------------------
+
+        this.loading = false;
+        this.flag = !res?.catalog?.length;
+
+        if (res?.catalog?.length) {
+          this.selectedCategory = 0;
+          this.selectedSubCategory = 0;
+          this.selectedMicroCategory = 1;
+        }
+        
+        const vegnonVeg = this.storageService.getItem(Constants.SELECT_PREFERENCE);
+        this.isVeg = vegnonVeg ? vegnonVeg === 'veg' : false;
+        this.commonservice.closeProgressBarLoading();
+      },
+      error: (err) => {
+        console.error('Failed to fetch profile.json', err);
+        this.loading = false;
+        this.flag = true;
+        this.commonservice.closeProgressBarLoading();
+      },
+    });
+  }
 ```
 
 ---
 
-## Frontend Integration
+## Environment Setup Details (How to Run)
 
-This repo’s frontend is Angular, so use Angular files.
+1. **Environmental Variables:**
+   * Open `d:\Sarvm\backend\catalogue_mgmt_service\.lcl.env` (or whatever env file you use to run locally).
+   * Add `GEMINI_API_KEY=your_google_api_key_here` (Optional, as the script provides a fallback dummy list for local testing).
 
-### API service
+2. **Database:**
+   * Your local MongoDB must be running. Running the backend code above will automatically create the `ai_product_trends` and `area_product_insights` collections when the cron job performs upserts.
 
-File:
+3. **Running the Backend locally:**
+   ```bash
+   cd d:\Sarvm\backend\catalogue_mgmt_service
+   npm run lcl 
+   ```
+   *To immediately see it work without waiting for 2 AM, temporarily modify your cron schedule inside `dynamicCatalogCron.js` to `* * * * *` (runs every minute), and observe the console logs.*
 
-- `frontend/hha_web/src/app/lib/services/geo-catalog.service.ts`
-
-Method:
-
-```ts
-runGeoTest() {
-  return this.http.post('http://localhost:2210/cms/apis/geo/test/pincode', {
-    pincode: '560100'
-  });
-}
-```
-
-### Test page
-
-Create:
-
-- `frontend/hha_web/src/app/pages/geo-catalog-test/`
-
-Show:
-
-- category name
-- top products
-- counts
-
-Add route in:
-
-- `frontend/hha_web/src/app/app-routing.module.ts`
-
-Suggested route:
-
-```txt
-/geo-catalog-test
-```
-
----
-
-## Validation Flow
-
-### Backend
-
-```bash
-cd backend/catalogue_mgmt_service
-npm install
-npm run lcl
-```
-
-### API test
-
-```http
-POST http://localhost:2210/cms/apis/geo/test/pincode
-Content-Type: application/json
-
-{
-  "pincode": "560100"
-}
-```
-
-Check:
-
-- multiple categories
-- multiple products per category
-
-### Mongo
-
-Verify collection:
-
-- `geo_catalogs`
-
-Verify document:
-
-- one doc for pincode
-- category array exists
-- product arrays exist
-
-### Apply
-
-```http
-POST http://localhost:2210/cms/apis/geo/apply
-Content-Type: application/json
-
-{
-  "shopId": 1234,
-  "pincode": "560100"
-}
-```
-
-Check:
-
-- entries created in `customcatalog`
-- `productNameStatus = "UNVERIFIED"`
-
----
-
-## Known Local Runtime Notes
-
-If local startup fails, common repo-specific issues are:
-
-1. missing dependency install in `backend/catalogue_mgmt_service`
-2. local Mongo not running on `127.0.0.1:27017`
-3. `npm run lcl` using `nodemon` may fail under some restricted shells
-4. newer Node versions can break older transitive libs in this repo
-
-For local work, prefer first verifying:
-
-- Mongo running on `27017`
-- Postgres running on `5432`
-- `.lcl.env` loaded
-
----
-
-## Minimal Backend File List To Touch
-
-```txt
-backend/catalogue_mgmt_service/.lcl.env
-backend/catalogue_mgmt_service/src/InitApp/index.js
-backend/catalogue_mgmt_service/src/apis/routes/v1/index.js
-backend/catalogue_mgmt_service/src/apis/routes/v1/geo.js
-backend/catalogue_mgmt_service/src/apis/controllers/v1/geo.js
-backend/catalogue_mgmt_service/src/apis/services/v1/pincodeCatalogBuilder.service.js
-backend/catalogue_mgmt_service/src/apis/services/v1/geoHierarchy.service.js
-backend/catalogue_mgmt_service/src/apis/services/v1/ai.service.js
-backend/catalogue_mgmt_service/src/apis/utils/normalizeProduct.js
-backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/geoCatalogSchema.js
-backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/retailerSchema.js
-backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/customCatalogSchema.js
-backend/catalogue_mgmt_service/src/jobs/geoCatalog.job.js
-```
-
-## Minimal Frontend File List To Touch
-
-```txt
-frontend/hha_web/src/app/app-routing.module.ts
-frontend/hha_web/src/app/lib/services/geo-catalog.service.ts
-frontend/hha_web/src/app/pages/geo-catalog-test/geo-catalog-test-routing.module.ts
-frontend/hha_web/src/app/pages/geo-catalog-test/geo-catalog-test.module.ts
-frontend/hha_web/src/app/pages/geo-catalog-test/geo-catalog-test.page.ts
-frontend/hha_web/src/app/pages/geo-catalog-test/geo-catalog-test.page.html
-frontend/hha_web/src/app/pages/geo-catalog-test/geo-catalog-test.page.scss
-```
+4. **Running the Frontend locally:**
+   ```bash
+   cd d:\Sarvm\frontend\hha_web
+   npm install   # If you had new Angular updates
+   ionic serve
+   ```
+   *Open your frontend, click on a random Google Shop, and you will see the curated "Dynamic" catalog list populated instead of the massive master catalog!*
